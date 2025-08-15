@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Redirecting…</title>
+  <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <meta http-equiv="Expires" content="0" />
+  <style>
+    html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+    .wrap{height:100%;display:grid;place-items:center;background:#0b0b0b;color:#eee}
+    .card{max-width:560px;padding:28px;border-radius:14px;background:#141414;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+    h1{font-size:22px;margin:0 0 8px}
+    p{opacity:.8;margin:.25rem 0}
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+</head>
+<body>
+  <div class="wrap"><div class="card">
+    <h1>Redirecting…</h1><p>One moment while we route you.</p>
+  </div></div>
+
+  <script>
+    // =========================
+    // 🚨 REQUIRED: Paste your published CSV URL (must end with output=csv)
+    const CSV_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vSO7dKqt9Fst8f5EW3MH307osIhKeelEKhD54PZzGUUmCSi6jY7Psf_8jvu26DEBfNJwFlFsb7o9GFF/pub?gid=0&single=true&output=csv";
+    // =========================
+
+    const DEBUG = new URLSearchParams(location.search).has("debug");
+
+    // ---- General helpers ----
+    const norm  = v => (v ?? "").toString().trim();
+    const upper = v => norm(v).toUpperCase();
+    const num   = v => {
+      const s = norm(v).replace(/,/g, "");
+      const n = Number(s);
+      return Number.isFinite(n) ? n : 0;
+    };
+    const hasHttp = v => /^https?:\/\//i.test(norm(v));
+    const withCB  = url => url + (url.includes("?") ? "&" : "?") + "cb=" + Date.now();
+
+    // Normalize header keys so "Manual Override" / "MANUAL_OVERRIDE" both work
+    function canonKeys(row) {
+      const out = {};
+      for (const k in row) out[ upper(k).replace(/\s+/g, "_") ] = row[k];
+      return out;
+    }
+
+    // First row per SECTION wins
+    function mapBySection(rows) {
+      const map = {};
+      for (const raw of rows) {
+        const r = canonKeys(raw);
+        const sec = upper(r.SECTION);
+        if (!sec) continue;
+        if (!map[sec]) map[sec] = r;
+      }
+      return map;
+    }
+
+    function shape(r = {}) {
+      const RR = canonKeys(r);
+      return {
+        section: upper(RR.SECTION),
+        status:  upper(RR.STATUS),
+        cap:     num(RR.CAP),
+        count:   num(RR.COUNT),
+        pub:     norm(RR.PUBLIC_LINK),
+        priv:    norm(RR.PRIVATE_LINK),
+        manual:  upper(RR.MANUAL_OVERRIDE ?? RR.MANUAL ?? "AUTO")
+      };
+    }
+
+    function decide(map) {
+      const A = shape(map.AUDIT);
+      const W = shape(map.WAITLIST);
+      const O = shape(map.OVERFLOW);
+
+      const hasA = hasHttp(A.pub), hasW = hasHttp(W.pub), hasO = hasHttp(O.pub);
+
+      // 1) Manual overrides (Audit > Waitlist > Overflow)
+      if (A.manual === "ON" && hasA) return { dest: A.pub, why: "manual: AUDIT" };
+      if (W.manual === "ON" && hasW) return { dest: W.pub,  why: "manual: WAITLIST" };
+      if (O.manual === "ON" && hasO) return { dest: O.pub,  why: "manual: OVERFLOW" };
+
+      // 2) Normal flow (OFF = closed)
+      const auditOpen    = (A.manual !== "OFF") && A.status === "OPEN" && A.count < A.cap && hasA;
+      const waitlistOpen = (W.manual !== "OFF") && W.status === "OPEN" && W.count < W.cap && hasW;
+
+      if (auditOpen)    return { dest: A.pub, why: "auto: AUDIT open" };
+      if (waitlistOpen) return { dest: W.pub, why: "auto: WAITLIST open" };
+
+      // 3) Else Overflow if available and not OFF
+      if ((O.manual !== "OFF") && hasO) return { dest: O.pub, why: "auto: OVERFLOW default" };
+
+      // 4) Final fallback: any public link (Overflow → Waitlist → Audit)
+      if (hasO) return { dest: O.pub, why: "fallback: OVERFLOW" };
+      if (hasW) return { dest: W.pub, why: "fallback: WAITLIST" };
+      if (hasA) return { dest: A.pub, why: "fallback: AUDIT" };
+
+      return { dest: null, why: "no valid PUBLIC_LINKs" };
+    }
+
+    function redirectTo(url, why) {
+      if (DEBUG) console.log("Routing:", why, "->", url);
+      try { window.location.replace(url); }
+      catch (e) { console.error("Redirect failed:", e, "url=", url); }
+    }
+
+    // ---- Loaders: race Papa XHR vs fetch() with timeout ----
+    function loadViaPapa(url, onData, onError) {
+      Papa.parse(url, {
+        download: true,
+        header: true,
+        skipEmptyLines: true,
+        transformHeader: h => upper(h).replace(/\s+/g, "_"),
+        transform: v => norm(v),
+        complete: (res) => {
+          if (!res || !Array.isArray(res.data)) return onError(new Error("Papa complete but no data"));
+          onData(res.data, "papa");
+        },
+        error: (e) => onError(e)
+      });
+    }
+
+    async function loadViaFetch(url, timeoutMs = 8000) {
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, { cache: "no-store", redirect: "follow", credentials: "omit", signal: ctl.signal });
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const text = await res.text();
+        const parsed = Papa.parse(text, {
+          header: true,
+          skipEmptyLines: true,
+          transformHeader: h => upper(h).replace(/\s+/g, "_"),
+          transform: v => norm(v)
+        });
+        if (!parsed || !Array.isArray(parsed.data)) throw new Error("Parsed but no array data");
+        return parsed.data;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    (function main(){
+      // Pre-flight sanity checks to avoid “mystery hang”
+      if (!CSV_URL || CSV_URL === "PASTE_CSV_URL_HERE") {
+        console.error("CSV_URL not set. Replace the placeholder with your 'Publish to the web → CSV' link.");
+        return;
+      }
+      if (!/^https:\/\//i.test(CSV_URL)) {
+        console.warn("CSV_URL should be https. Current:", CSV_URL);
+      }
+      if (!/output=csv/i.test(CSV_URL)) {
+        console.warn("CSV_URL may not be the publish-to-web CSV (missing output=csv). Current:", CSV_URL);
+      }
+
+      const url = withCB(CSV_URL);
+      let done = false;
+      let lastRows = null;
+
+      const finish = (rows, source) => {
+        if (done) return; done = true;
+        try {
+          lastRows = rows;
+          const map = mapBySection(rows);
+          const choice = decide(map);
+          if (choice.dest) {
+            redirectTo(choice.dest, `${source}: ${choice.why}`);
+          } else {
+            console.warn("No destination resolved. Parsed rows:", {
+              AUDIT: shape(map.AUDIT), WAITLIST: shape(map.WAITLIST), OVERFLOW: shape(map.OVERFLOW)
+            });
+          }
+        } catch (e) {
+          console.error("Routing error:", e);
+        }
+      };
+
+      const fail = (label, err) => {
+        if (DEBUG) console.warn(label, err);
+      };
+
+      // Start Papa loader
+      loadViaPapa(url, (rows) => finish(rows, "papa"), (e) => fail("Papa error:", e));
+
+      // Start fetch loader in parallel
+      loadViaFetch(url).then(rows => finish(rows, "fetch")).catch(e => fail("Fetch path error:", e));
+
+      // Hard guard: if no redirect after 10s, dump a debug summary
+      setTimeout(() => {
+        if (!done) {
+          console.debug("Still on page after 10s. CSV_URL=", CSV_URL);
+          if (lastRows) {
+            const map = mapBySection(lastRows);
+            const A = shape(map.AUDIT), W = shape(map.WAITLIST), O = shape(map.OVERFLOW);
+            console.table([A, W, O].map(x => ({
+              SECTION:x.section, STATUS:x.status, CAP:x.cap, COUNT:x.count,
+              MANUAL:x.manual, PUBLIC_LINK:x.pub
+            })));
+          } else {
+            console.debug("No rows parsed yet — check network/CORS or that the URL is the published CSV.");
+          }
+        }
+      }, 10000);
+    })();
+  </script>
+</body>
+</html>
